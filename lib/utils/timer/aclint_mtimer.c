@@ -51,10 +51,29 @@ static void mtimer_time_wr32(bool timecmp, u64 value, volatile u64 *addr)
 	writel_relaxed((u32)value, (void *)(addr));
 }
 
+static u64 csr_time_value(void)
+{
+#if __riscv_xlen != 32
+	return csr_read(CSR_TIME);
+#else
+	u32 lo, hi;
+
+	do {
+		hi = csr_read(CSR_TIMEH);
+		lo = csr_read(CSR_TIME);
+	} while (hi != csr_read(CSR_TIMEH));
+
+	return ((u64)hi << 32) | (u64)lo;
+#endif
+}
+
 static u64 mtimer_value(void)
 {
 	struct aclint_mtimer_data *mt = mtimer_hartid2data[current_hartid()];
 	u64 *time_val = (void *)mt->mtime_addr;
+
+	if (!mt->has_mtime)
+		return csr_time_value();
 
 	/* Read MTIMER Time Value */
 	return mt->time_rd(time_val);
@@ -95,7 +114,7 @@ void aclint_mtimer_sync(struct aclint_mtimer_data *mt)
 	struct aclint_mtimer_data *reference;
 
 	/* Sync-up non-shared MTIME if reference is available */
-	if (mt->has_shared_mtime || !mt->time_delta_reference)
+	if (!mt->has_mtime || mt->has_shared_mtime || !mt->time_delta_reference)
 		return;
 
 	reference = mt->time_delta_reference;
@@ -149,10 +168,10 @@ int aclint_mtimer_cold_init(struct aclint_mtimer_data *mt,
 	int rc;
 
 	/* Sanity checks */
-	if (!mt || !mt->mtime_size ||
+	if (!mt || (mt->has_mtime && !mt->mtime_size) ||
 	    (mt->hart_count && !mt->mtimecmp_size) ||
-	    (mt->mtime_addr & (ACLINT_MTIMER_ALIGN - 1)) ||
-	    (mt->mtime_size & (ACLINT_MTIMER_ALIGN - 1)) ||
+	    (mt->has_mtime && (mt->mtime_addr & (ACLINT_MTIMER_ALIGN - 1))) ||
+	    (mt->has_mtime && (mt->mtime_size & (ACLINT_MTIMER_ALIGN - 1))) ||
 	    (mt->mtimecmp_addr & (ACLINT_MTIMER_ALIGN - 1)) ||
 	    (mt->mtimecmp_size & (ACLINT_MTIMER_ALIGN - 1)) ||
 	    (mt->first_hartid >= SBI_HARTMASK_MAX_BITS) ||
@@ -179,7 +198,13 @@ int aclint_mtimer_cold_init(struct aclint_mtimer_data *mt,
 		mtimer_hartid2data[mt->first_hartid + i] = mt;
 
 	/* Add MTIMER regions to the root domain */
-	if (mt->mtime_addr == (mt->mtimecmp_addr + mt->mtimecmp_size)) {
+	if (!mt->has_mtime) {
+		rc = sbi_domain_root_add_memrange(mt->mtimecmp_addr,
+						mt->mtimecmp_size, MTIMER_REGION_ALIGN,
+						SBI_DOMAIN_MEMREGION_MMIO);
+		if (rc)
+			return rc;
+	} else if (mt->mtime_addr == (mt->mtimecmp_addr + mt->mtimecmp_size)) {
 		rc = sbi_domain_root_add_memrange(mt->mtimecmp_addr,
 					mt->mtime_size + mt->mtimecmp_size,
 					MTIMER_REGION_ALIGN,
